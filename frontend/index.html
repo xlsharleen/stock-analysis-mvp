@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="zh">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stock MVP</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      margin: 16px;
+    }
+
+    .row {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+    }
+
+    .left {
+      flex: 2;
+      min-width: 520px;
+    }
+
+    .right {
+      flex: 1;
+      min-width: 360px;
+    }
+
+    .card {
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    #priceChart,
+    #rsiChart,
+    #volChart {
+      width: 100%;
+      height: 280px;
+    }
+
+    textarea {
+      width: 100%;
+      height: 90px;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    ul {
+      margin: 6px 0 0 18px;
+    }
+
+    .small {
+      color: #666;
+      font-size: 12px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+    <label>Symbol：</label>
+    <input id="symbol" value="AAPL" style="width:120px" />
+    <button id="loadBtn">加载</button>
+    <span id="status" class="small"></span>
+  </div>
+
+  <div class="row">
+    <div class="left">
+      <div class="card">
+        <div class="small">价格 + MA</div>
+        <div id="priceChart"></div>
+      </div>
+      <div class="grid2">
+        <div class="card">
+          <div class="small">RSI14</div>
+          <div id="rsiChart"></div>
+        </div>
+        <div class="card">
+          <div class="small">VOL20</div>
+          <div id="volChart"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div><b>评分</b> <span id="asof"></span></div>
+        <div>Score: <b id="score"></b> | Reco: <b id="reco"></b> | Conf: <b id="conf"></b></div>
+        <div class="small">Evidence</div>
+        <ul id="evidence"></ul>
+        <div class="small">Caveats</div>
+        <ul id="caveats"></ul>
+      </div>
+
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <b>AI 解释（Explain）</b>
+          <button id="explainBtn">生成解释</button>
+        </div>
+        <pre id="explainOut" class="small"></pre>
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="card">
+        <b>AI 交易策略助手（SSE）</b>
+        <div class="small">输入问题（例如：中线策略、最大回撤 8%，给入场/出场/止损）</div>
+        <textarea id="q">给我一个中线策略建议，包含入场/出场/仓位/止损止盈，并结合当前评分证据。</textarea>
+        <button id="strategyBtn">开始生成</button>
+        <button id="stopBtn">停止</button>
+        <pre id="strategyOut"></pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = "http://127.0.0.1:8000";
+    let currentSymbol = "AAPL";
+    let currentAsof = null;
+    let evtSource = null;
+
+    const priceChart = echarts.init(document.getElementById("priceChart"));
+    const rsiChart = echarts.init(document.getElementById("rsiChart"));
+    const volChart = echarts.init(document.getElementById("volChart"));
+
+    function setStatus(t) { document.getElementById("status").textContent = t; }
+
+    async function fetchJson(url, options) {
+      const r = await fetch(url, options);
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(txt || r.statusText);
+      }
+      return await r.json();
+    }
+
+    function setList(id, items) {
+      const ul = document.getElementById(id);
+      ul.innerHTML = "";
+      (items || []).forEach(t => {
+        const li = document.createElement("li");
+        li.textContent = t;
+        ul.appendChild(li);
+      });
+    }
+
+    function plotPrice(bars, inds) {
+      const dates = bars.map(x => x.date);
+      const close = bars.map(x => x.close);
+      const ma20 = inds.map(x => x.ma20);
+      const ma60 = inds.map(x => x.ma60);
+
+      priceChart.setOption({
+        tooltip: { trigger: "axis" },
+        legend: { data: ["Close", "MA20", "MA60"] },
+        xAxis: { type: "category", data: dates },
+        yAxis: { type: "value" },
+        dataZoom: [{ type: "inside" }, { type: "slider" }],
+        series: [
+          { name: "Close", type: "line", data: close, showSymbol: false },
+          { name: "MA20", type: "line", data: ma20, showSymbol: false },
+          { name: "MA60", type: "line", data: ma60, showSymbol: false },
+        ]
+      });
+    }
+
+    function plotRSI(inds) {
+      const dates = inds.map(x => x.date);
+      const rsi = inds.map(x => x.rsi14);
+      rsiChart.setOption({
+        tooltip: { trigger: "axis" },
+        xAxis: { type: "category", data: dates },
+        yAxis: { type: "value", min: 0, max: 100 },
+        dataZoom: [{ type: "inside" }, { type: "slider" }],
+        series: [{ name: "RSI14", type: "line", data: rsi, showSymbol: false }]
+      });
+    }
+
+    function plotVOL(inds) {
+      const dates = inds.map(x => x.date);
+      const vol = inds.map(x => (x.vol20 == null ? null : x.vol20 * 100.0));
+      volChart.setOption({
+        tooltip: { trigger: "axis" },
+        xAxis: { type: "category", data: dates },
+        yAxis: { type: "value" },
+        dataZoom: [{ type: "inside" }, { type: "slider" }],
+        series: [{ name: "VOL20(%)", type: "line", data: vol, showSymbol: false }]
+      });
+    }
+
+    async function loadAll() {
+      const sym = document.getElementById("symbol").value.trim().toUpperCase();
+      if (!sym) return;
+      currentSymbol = sym;
+      setStatus("加载中…（如果是首次运行，请先跑 refresh.py）");
+
+      const price = await fetchJson(`${API_BASE}/api/stock/${sym}/price`);
+      const inds = await fetchJson(`${API_BASE}/api/stock/${sym}/indicators`);
+      const score = await fetchJson(`${API_BASE}/api/stock/${sym}/score`);
+
+      currentAsof = score.asof_date;
+
+      document.getElementById("asof").textContent = `asof=${score.asof_date}`;
+      document.getElementById("score").textContent = score.score_total.toFixed(1);
+      document.getElementById("reco").textContent = score.reco;
+      document.getElementById("conf").textContent = (score.confidence * 100).toFixed(0) + "%";
+      setList("evidence", score.evidence);
+      setList("caveats", score.caveats);
+
+      plotPrice(price.bars, inds.indicators);
+      plotRSI(inds.indicators);
+      plotVOL(inds.indicators);
+
+      document.getElementById("explainOut").textContent = "";
+      document.getElementById("strategyOut").textContent = "";
+      setStatus("完成");
+    }
+
+    async function explain() {
+      const sym = currentSymbol;
+      const body = { symbol: sym, asof_date: currentAsof };
+      const out = await fetchJson(`${API_BASE}/api/ai/explain`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      document.getElementById("explainOut").textContent = out.explain_text;
+    }
+
+    function stopStream() {
+      if (evtSource) {
+        evtSource.close();
+        evtSource = null;
+      }
+    }
+
+    async function startStrategyStream() {
+      stopStream();
+      document.getElementById("strategyOut").textContent = "";
+
+      const sym = currentSymbol;
+      const q = document.getElementById("q").value;
+      const payload = { symbol: sym, asof_date: currentAsof, question: q, constraints: { horizon: "mid" } };
+
+      // SSE: 用 fetch+ReadableStream 更通用（因为这里是 POST）
+      const r = await fetch(`${API_BASE}/api/ai/strategy/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      if (!r.ok) {
+        const t = await r.text();
+        throw new Error(t);
+      }
+
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // parse SSE frames roughly
+        // split by double newline
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop(); // remainder
+        for (const p of parts) {
+          // each part contains lines like: event: token \n data: xxx
+          const lines = p.split("\n");
+          let event = "token";
+          let dataLines = [];
+          for (const line of lines) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            if (line.startsWith("data:")) dataLines.push(line.slice(5));
+          }
+          const data = dataLines.join("\n").trimEnd();
+          if (event === "token") {
+            document.getElementById("strategyOut").textContent += data;
+          } else if (event === "done") {
+            document.getElementById("strategyOut").textContent += "\n\n[done]";
+          }
+        }
+      }
+    }
+
+    document.getElementById("loadBtn").onclick = () => loadAll().catch(e => setStatus("错误: " + e.message));
+    document.getElementById("explainBtn").onclick = () => explain().catch(e => alert(e.message));
+    document.getElementById("strategyBtn").onclick = () => startStrategyStream().catch(e => alert(e.message));
+    document.getElementById("stopBtn").onclick = () => stopStream();
+
+
+    // 替换原有的 loadAll().catch(() => { });
+    window.addEventListener('DOMContentLoaded', () => {
+      console.log("DOM 已就绪，正在尝试初始化...");
+      loadAll().catch(e => {
+        console.error("初始化请求失败:", e);
+        setStatus("初始化错误: " + e.message);
+      });
+    });
+  </script>
+</body>
+
+</html>
